@@ -17,6 +17,9 @@ export default function ConflictsPage() {
   return (
     <>
       <h2>冲突</h2>
+      <p style={{ opacity: 0.7 }}>
+        历史全部保留：同一幂等键的真失败每次重试各记一条；幂等重放不产生记录，可据此对照。
+      </p>
       <table className="table">
         <thead>
           <tr>

@@ -29,6 +29,8 @@ class HoldOut(BaseModel):
     end_col: int
     party_size: int
     status: str
+    idempotency_key: str | None = None
+    replayed: bool = False
     model_config = {"from_attributes": True}
 
 
@@ -36,6 +38,7 @@ class HoldRequest(BaseModel):
     showtime_id: int
     party_size: int = Field(ge=1, le=12)
     preferred_row: int | None = None
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=80)
 
 
 class ConflictOut(BaseModel):

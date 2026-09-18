@@ -1,11 +1,13 @@
+import threading
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.models import ConflictLog, Hall, SeatHold, Showtime
+from app.models.models import ConflictLog, Hall, IdempotencyRecord, SeatHold, Showtime
 from app.schemas.schemas import (
     ConflictOut,
     HallOut,
@@ -24,6 +26,21 @@ from app.services.bond_engine import (
 )
 
 api_router = APIRouter()
+
+# Serializes same-key concurrent submits within one process (fast double-clicks,
+# in-flight retries). The unique index on idempotency_key is the cross-process
+# backstop; races there are handled via IntegrityError in create_hold.
+_idem_locks: dict[str, threading.Lock] = {}
+_idem_locks_guard = threading.Lock()
+
+
+def _idem_lock(key: str) -> threading.Lock:
+    with _idem_locks_guard:
+        lock = _idem_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _idem_locks[key] = lock
+        return lock
 
 
 def _aisles(hall: Hall) -> list[int]:
@@ -102,7 +119,15 @@ def seatmap(showtime_id: int, db: Session = Depends(get_db)):
 
 @api_router.get("/holds", response_model=list[HoldOut])
 def list_holds(db: Session = Depends(get_db)):
-    return db.scalars(select(SeatHold).order_by(SeatHold.id.desc())).all()
+    holds = db.scalars(select(SeatHold).order_by(SeatHold.id.desc())).all()
+    keys = {
+        r.hold_id: r.idempotency_key
+        for r in db.scalars(select(IdempotencyRecord)).all()
+    }
+    return [
+        HoldOut.model_validate(h).model_copy(update={"idempotency_key": keys.get(h.id)})
+        for h in holds
+    ]
 
 
 @api_router.get("/conflicts", response_model=list[ConflictOut])
@@ -111,7 +136,98 @@ def list_conflicts(db: Session = Depends(get_db)):
 
 
 @api_router.post("/holds", response_model=HoldOut)
-def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
+def create_hold(body: HoldRequest, response: Response, db: Session = Depends(get_db)):
+    # No key: legacy non-idempotent behaviour, every request occupies fresh seats.
+    if not body.idempotency_key:
+        return _allocate_hold(db, body)
+
+    key = body.idempotency_key
+    # Re-check under a per-key lock so concurrent identical submits cannot both
+    # allocate; the second one replays the hold created by the first.
+    with _idem_lock(key):
+        rec = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == key))
+        if rec is not None:
+            mismatch = _fingerprint_mismatch(rec, body)
+            if mismatch:
+                raise HTTPException(
+                    422,
+                    f"幂等键参数冲突：该键已绑定{mismatch}，不能复用为"
+                    f"场次{body.showtime_id}/人数{body.party_size}/偏好排{body.preferred_row or '无'}",
+                )
+            hold = db.get(SeatHold, rec.hold_id)
+            if hold is None:  # defensive: record without hold should never happen
+                raise HTTPException(410, "幂等键对应的持座已不存在")
+            rec.replay_count += 1
+            rec.replayed_at = datetime.utcnow()
+            db.commit()
+            response.headers["X-Idempotent-Replay"] = "true"
+            return HoldOut.model_validate(hold).model_copy(
+                update={"idempotency_key": key, "replayed": True}
+            )
+
+        try:
+            # allocate + insert record in one transaction so a failure writes no
+            # partial state and the client can safely retry with the same key.
+            hold = _allocate_hold(db, body, commit=False)
+            db.add(
+                IdempotencyRecord(
+                    idempotency_key=key,
+                    showtime_id=body.showtime_id,
+                    party_size=body.party_size,
+                    preferred_row=body.preferred_row,
+                    hold_id=hold.id,
+                )
+            )
+            db.commit()
+        except IntegrityError:
+            # Another process/worker won the race for this key between our
+            # SELECT and INSERT — replay its result instead of double booking.
+            db.rollback()
+            rec = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == key))
+            if rec is None:
+                raise HTTPException(409, "提交冲突，请用同一幂等键重试")
+            mismatch = _fingerprint_mismatch(rec, body)
+            if mismatch:
+                raise HTTPException(
+                    422,
+                    f"幂等键参数冲突：该键已绑定{mismatch}，不能复用为"
+                    f"场次{body.showtime_id}/人数{body.party_size}/偏好排{body.preferred_row or '无'}",
+                )
+            hold = db.get(SeatHold, rec.hold_id)
+            if hold is None:
+                raise HTTPException(410, "幂等键对应的持座已不存在")
+            rec.replay_count += 1
+            rec.replayed_at = datetime.utcnow()
+            db.commit()
+            response.headers["X-Idempotent-Replay"] = "true"
+            return HoldOut.model_validate(hold).model_copy(
+                update={"idempotency_key": key, "replayed": True}
+            )
+
+        db.refresh(hold)
+        response.headers["X-Idempotent-Replay"] = "false"
+        return HoldOut.model_validate(hold).model_copy(update={"idempotency_key": key})
+
+
+def _fingerprint_mismatch(rec: IdempotencyRecord, body: HoldRequest) -> str | None:
+    """Describe the bound fingerprint if it differs from the request, else None."""
+    if rec.showtime_id != body.showtime_id:
+        return f"场次{rec.showtime_id}"
+    if rec.party_size != body.party_size:
+        return f"场次{rec.showtime_id}/人数{rec.party_size}"
+    if (rec.preferred_row or None) != (body.preferred_row or None):
+        bound = f"偏好排{rec.preferred_row}" if rec.preferred_row else "无偏好排"
+        return f"场次{rec.showtime_id}/人数{rec.party_size}/{bound}"
+    return None
+
+
+def _allocate_hold(db: Session, body: HoldRequest, commit: bool = True) -> SeatHold:
+    """Find and persist a contiguous block. Raises 409 and logs on failure.
+
+    Conflict logs are written on every genuine failure (including a retry that
+    fails again) but never on idempotent replays, so the conflict history lets
+    operators compare real-failure retries against replays.
+    """
     st = db.get(Showtime, body.showtime_id)
     if not st:
         raise HTTPException(404, "场次不存在")
@@ -166,6 +282,9 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
         party_size=body.party_size,
     )
     db.add(hold)
-    db.commit()
-    db.refresh(hold)
+    if commit:
+        db.commit()
+        db.refresh(hold)
+    else:
+        db.flush()  # populate hold.id for the idempotency record FK
     return hold

@@ -41,6 +41,27 @@ class SeatHold(Base):
     showtime: Mapped[Showtime] = relationship(back_populates="holds")
 
 
+class IdempotencyRecord(Base):
+    """One row per client idempotency key; binds the request fingerprint to its hold.
+
+    A replay with the same key returns the linked hold without occupying new
+    seats. A replay whose (showtime_id, party_size, preferred_row) fingerprint
+    differs is rejected as a parameter conflict rather than mutating the hold.
+    """
+
+    __tablename__ = "idempotency_records"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    showtime_id: Mapped[int] = mapped_column(ForeignKey("showtimes.id"))
+    party_size: Mapped[int] = mapped_column(Integer)
+    preferred_row: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hold_id: Mapped[int] = mapped_column(ForeignKey("seat_holds.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    replayed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    replay_count: Mapped[int] = mapped_column(Integer, default=0)
+    hold: Mapped[SeatHold] = relationship()
+
+
 class ConflictLog(Base):
     __tablename__ = "conflict_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

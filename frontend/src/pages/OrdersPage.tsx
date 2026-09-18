@@ -10,6 +10,7 @@ type Hold = {
   end_col: number;
   party_size: number;
   status: string;
+  idempotency_key?: string | null;
 };
 
 export default function OrdersPage() {
@@ -17,9 +18,16 @@ export default function OrdersPage() {
   useEffect(() => {
     api<Hold[]>("/holds").then(setRows);
   }, []);
+  // 同一单号出现多行才是重复建单；幂等重试只会复用同一持座，故单号应唯一。
+  const duplicated = rows.filter(
+    (h, _i) => rows.filter((x) => x.order_code === h.order_code).length > 1,
+  );
   return (
     <>
       <h2>订单</h2>
+      {duplicated.length > 0 && (
+        <div className="err">发现重复单号：{[...new Set(duplicated.map((h) => h.order_code))].join(", ")}</div>
+      )}
       <table className="table">
         <thead>
           <tr>
@@ -28,6 +36,7 @@ export default function OrdersPage() {
             <th>座位</th>
             <th>人数</th>
             <th>状态</th>
+            <th>幂等键</th>
           </tr>
         </thead>
         <tbody>
@@ -40,6 +49,7 @@ export default function OrdersPage() {
               </td>
               <td>{h.party_size}</td>
               <td>{h.status}</td>
+              <td className="mono">{h.idempotency_key ?? "—"}</td>
             </tr>
           ))}
         </tbody>

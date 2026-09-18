@@ -29,6 +29,8 @@ class HoldOut(BaseModel):
     end_col: int
     party_size: int
     status: str
+    idempotency_key: str | None = None
+    replay: bool = False
     model_config = {"from_attributes": True}
 
 
@@ -43,6 +45,7 @@ class ConflictOut(BaseModel):
     showtime_id: int
     party_size: int
     reason: str
+    idempotency_key: str | None = None
     created_at: datetime
     model_config = {"from_attributes": True}
 

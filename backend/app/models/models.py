@@ -41,10 +41,24 @@ class SeatHold(Base):
     showtime: Mapped[Showtime] = relationship(back_populates="holds")
 
 
+class IdempotencyKey(Base):
+    """A client-supplied key bound to one hold request fingerprint (showtime/party/row)."""
+
+    __tablename__ = "idempotency_keys"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(120), unique=True)
+    showtime_id: Mapped[int] = mapped_column(ForeignKey("showtimes.id"))
+    party_size: Mapped[int] = mapped_column(Integer)
+    preferred_row: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hold_id: Mapped[int | None] = mapped_column(ForeignKey("seat_holds.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ConflictLog(Base):
     __tablename__ = "conflict_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     showtime_id: Mapped[int] = mapped_column(ForeignKey("showtimes.id"))
     party_size: Mapped[int] = mapped_column(Integer)
     reason: Mapped[str] = mapped_column(String(200))
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
